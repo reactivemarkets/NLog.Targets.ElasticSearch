@@ -26,16 +26,31 @@ namespace NLog.Targets.ElasticSearch
         private Layout _password;
         private Layout _apiKeyId;
         private Layout _apiKey;
-        private HashSet<string> _excludedProperties = new HashSet<string>(new[] { "CallerMemberName", "CallerFilePath", "CallerLineNumber", "MachineName", "ThreadId" });
+        private DateTimeOffset _lastSendFailure = DateTimeOffset.MinValue;
+        private HashSet<string> _excludedProperties = new HashSet<string>(
+            new[]
+            {
+                "CallerMemberName",
+                "CallerFilePath",
+                "CallerLineNumber",
+                "MachineName",
+                "ThreadId"
+            }
+        );
         private JsonSerializer _jsonSerializer;
         private JsonSerializer _flatJsonSerializer;
         private readonly Lazy<JsonSerializerSettings> _jsonSerializerSettings;
         private readonly Lazy<JsonSerializerSettings> _flatSerializerSettings;
 
-        private JsonSerializer JsonSerializer => _jsonSerializer ?? (_jsonSerializer = JsonSerializer.CreateDefault(_jsonSerializerSettings.Value));
-        private JsonSerializer JsonSerializerFlat => _flatJsonSerializer ?? (_flatJsonSerializer = JsonSerializer.CreateDefault(_flatSerializerSettings.Value));
+        private JsonSerializer JsonSerializer =>
+            _jsonSerializer
+            ?? (_jsonSerializer = JsonSerializer.CreateDefault(_jsonSerializerSettings.Value));
+        private JsonSerializer JsonSerializerFlat =>
+            _flatJsonSerializer
+            ?? (_flatJsonSerializer = JsonSerializer.CreateDefault(_flatSerializerSettings.Value));
 
         private JsonLayout _documentInfoJsonLayout;
+        private FixedSizeQueue<AsyncLogEventInfo> _notSentEventsQueue;
 
         /// <summary>
         /// Gets or sets a connection string name to retrieve the Uri from.
@@ -88,12 +103,20 @@ namespace NLog.Targets.ElasticSearch
         /// <summary>
         /// Username for basic auth
         /// </summary>
-        public string Username { get => (_username as SimpleLayout)?.Text; set => _username = value ?? string.Empty; }
+        public string Username
+        {
+            get => (_username as SimpleLayout)?.Text;
+            set => _username = value ?? string.Empty;
+        }
 
         /// <summary>
         /// Password for basic auth
         /// </summary>
-        public string Password { get => (_password as SimpleLayout)?.Text; set => _password = value ?? string.Empty; }
+        public string Password
+        {
+            get => (_password as SimpleLayout)?.Text;
+            set => _password = value ?? string.Empty;
+        }
 
         /// <inheritdoc />
         public WebProxy Proxy { get; set; }
@@ -149,7 +172,11 @@ namespace NLog.Targets.ElasticSearch
         /// Gets or sets whether to include all properties of the log event in the document
         /// </summary>
         [Obsolete("Replaced by IncludeEventProperties")]
-        public bool IncludeAllProperties { get => IncludeEventProperties; set => IncludeEventProperties = value; }
+        public bool IncludeAllProperties
+        {
+            get => IncludeEventProperties;
+            set => IncludeEventProperties = value;
+        }
 
         /// <summary>
         /// Gets or sets whether to include LogEvent Properties in the document
@@ -215,14 +242,36 @@ namespace NLog.Targets.ElasticSearch
         public bool EnableJsonLayout { get; set; }
 
         /// <summary>
+        /// Gets or sets the maximum number of items in the queue.
+        /// If the queue size is exceeded, then the oldest items are discarded.
+        /// Default: 1000
+        /// </summary>
+        public int MaxQueueItems { get; set; } = 1000;
+
+        /// <summary>
+        /// Gets or sets the timeout in milliseconds to wait for a new try to send the log events to the server.
+        /// The logs will be queued and retried when the time exceeded and the next logs are written.
+        /// Default: 10000
+        /// </summary>
+        public int SendTimeoutOnFailureInMilliseconds { get; set; } = 10000;
+
+        /// <summary>
         /// <inheritdoc cref="IElasticSearchTarget.ApiKeyId"/>
         /// </summary>
-        public string ApiKeyId { get => (_apiKeyId as SimpleLayout)?.Text; set => _apiKeyId = value ?? string.Empty; }
+        public string ApiKeyId
+        {
+            get => (_apiKeyId as SimpleLayout)?.Text;
+            set => _apiKeyId = value ?? string.Empty;
+        }
 
         /// <summary>
         /// <inheritdoc cref="IElasticSearchTarget.ApiKey"/>
         /// </summary>
-        public string ApiKey { get => (_apiKey as SimpleLayout)?.Text; set => _apiKey = value ?? string.Empty; }
+        public string ApiKey
+        {
+            get => (_apiKey as SimpleLayout)?.Text;
+            set => _apiKey = value ?? string.Empty;
+        }
 
         /// <summary>
         /// <inheritdoc cref="IElasticSearchTarget.IncludeDefaultFields"/>
@@ -239,15 +288,21 @@ namespace NLog.Targets.ElasticSearch
 
             ObjectTypeConverters = new List<ObjectTypeConvert>()
             {
-                new ObjectTypeConvert(typeof(System.Reflection.Assembly)),     // Skip serializing all types in application
-                new ObjectTypeConvert(typeof(System.Reflection.Module)),       // Skip serializing all types in application
-                new ObjectTypeConvert(typeof(System.Reflection.MemberInfo)),   // Skip serializing all types in application
-                new ObjectTypeConvert(typeof(System.IO.Stream)),               // Skip serializing Stream properties, since they throw
-                new ObjectTypeConvert(typeof(System.Net.IPAddress)),           // Skip serializing IPAdress properties, since they throw when IPv6 address
+                new ObjectTypeConvert(typeof(System.Reflection.Assembly)), // Skip serializing all types in application
+                new ObjectTypeConvert(typeof(System.Reflection.Module)), // Skip serializing all types in application
+                new ObjectTypeConvert(typeof(System.Reflection.MemberInfo)), // Skip serializing all types in application
+                new ObjectTypeConvert(typeof(System.IO.Stream)), // Skip serializing Stream properties, since they throw
+                new ObjectTypeConvert(typeof(System.Net.IPAddress)), // Skip serializing IPAdress properties, since they throw when IPv6 address
             };
 
-            _jsonSerializerSettings = new Lazy<JsonSerializerSettings>(() => CreateJsonSerializerSettings(false, ObjectTypeConverters), LazyThreadSafetyMode.PublicationOnly);
-            _flatSerializerSettings = new Lazy<JsonSerializerSettings>(() => CreateJsonSerializerSettings(true, ObjectTypeConverters), LazyThreadSafetyMode.PublicationOnly);
+            _jsonSerializerSettings = new Lazy<JsonSerializerSettings>(
+                () => CreateJsonSerializerSettings(false, ObjectTypeConverters),
+                LazyThreadSafetyMode.PublicationOnly
+            );
+            _flatSerializerSettings = new Lazy<JsonSerializerSettings>(
+                () => CreateJsonSerializerSettings(true, ObjectTypeConverters),
+                LazyThreadSafetyMode.PublicationOnly
+            );
         }
 
         /// <inheritdoc />
@@ -269,23 +324,31 @@ namespace NLog.Targets.ElasticSearch
             {
                 if (!string.IsNullOrWhiteSpace(apiKey) && !string.IsNullOrWhiteSpace(apiKeyId))
                 {
-                    connectionPool = new CloudConnectionPool(cloudId, new ApiKeyAuthenticationCredentials(apiKeyId, apiKey));
+                    connectionPool = new CloudConnectionPool(
+                        cloudId,
+                        new ApiKeyAuthenticationCredentials(apiKeyId, apiKey)
+                    );
                 }
                 else
                 {
-                    connectionPool = new CloudConnectionPool(cloudId, new BasicAuthenticationCredentials(username, password));
+                    connectionPool = new CloudConnectionPool(
+                        cloudId,
+                        new BasicAuthenticationCredentials(username, password)
+                    );
                 }
             }
             else
             {
                 var uri = _uri?.Render(eventInfo) ?? string.Empty;
-                var nodes = uri.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(url => new Uri(url));
+                var nodes = uri.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(url => new Uri(url));
                 connectionPool = new StaticConnectionPool(nodes);
             }
 
-            var config = ElasticsearchSerializer == null
-                ? new ConnectionConfiguration(connectionPool)
-                : new ConnectionConfiguration(connectionPool, ElasticsearchSerializer);
+            var config =
+                ElasticsearchSerializer == null
+                    ? new ConnectionConfiguration(connectionPool)
+                    : new ConnectionConfiguration(connectionPool, ElasticsearchSerializer);
 
             if (string.IsNullOrWhiteSpace(cloudId))
             {
@@ -306,7 +369,9 @@ namespace NLog.Targets.ElasticSearch
                 config = config.DisableAutomaticProxyDetection();
 
             if (DisableCertificateValidation)
-                config = config.ServerCertificateValidationCallback((o, certificate, chain, errors) => true).ServerCertificateValidationCallback(CertificateValidations.AllowAll);
+                config = config
+                    .ServerCertificateValidationCallback((o, certificate, chain, errors) => true)
+                    .ServerCertificateValidationCallback(CertificateValidations.AllowAll);
 
             if (DisablePing)
                 config = config.DisablePing();
@@ -320,11 +385,17 @@ namespace NLog.Targets.ElasticSearch
 
                 if (!(Proxy.Credentials is NetworkCredential))
                 {
-                    throw new InvalidOperationException($"Type {Proxy.Credentials.GetType().FullName} of proxy credentials isn't supported. Use {typeof(NetworkCredential).FullName} instead.");
+                    throw new InvalidOperationException(
+                        $"Type {Proxy.Credentials.GetType().FullName} of proxy credentials isn't supported. Use {typeof(NetworkCredential).FullName} instead."
+                    );
                 }
 
                 var credential = (NetworkCredential)Proxy.Credentials;
-                config = config.Proxy(Proxy.Address, credential.UserName, credential.SecurePassword);
+                config = config.Proxy(
+                    Proxy.Address,
+                    credential.UserName,
+                    credential.SecurePassword
+                );
             }
             else if (ProxyAddress != null)
             {
@@ -346,35 +417,56 @@ namespace NLog.Targets.ElasticSearch
             _client = new ElasticLowLevelClient(config);
 
             if (!string.IsNullOrEmpty(ExcludedProperties))
-                _excludedProperties = new HashSet<string>(ExcludedProperties.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries));
+                _excludedProperties = new HashSet<string>(
+                    ExcludedProperties.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                );
 
             if (EnableJsonLayout)
             {
                 if (Layout is SimpleLayout)
                 {
-                    InternalLogger.Info("ElasticSearch: Layout-property has type SimpleLayout, instead of the expected JsonLayout");
+                    InternalLogger.Info(
+                        "ElasticSearch: Layout-property has type SimpleLayout, instead of the expected JsonLayout"
+                    );
                 }
 
                 _documentInfoJsonLayout = new JsonLayout()
                 {
-                    Attributes = {
-                        new JsonAttribute(OpCodeCreate ? "create" : "index", new JsonLayout()
-                        {
-                            Attributes = {
-                                new JsonAttribute("_index", Index) { EscapeForwardSlash = false },
-                                new JsonAttribute("_type", DocumentType ?? new SimpleLayout("")) { EscapeForwardSlash = false },
-                                new JsonAttribute("pipeline", Pipeline ?? new SimpleLayout("")) { EscapeForwardSlash = false },
-                            }
-                        }, encode: false)
+                    Attributes =
+                    {
+                        new JsonAttribute(
+                            OpCodeCreate ? "create" : "index",
+                            new JsonLayout()
+                            {
+                                Attributes =
+                                {
+                                    new JsonAttribute("_index", Index)
+                                    {
+                                        EscapeForwardSlash = false
+                                    },
+                                    new JsonAttribute("_type", DocumentType ?? new SimpleLayout(""))
+                                    {
+                                        EscapeForwardSlash = false
+                                    },
+                                    new JsonAttribute("pipeline", Pipeline ?? new SimpleLayout(""))
+                                    {
+                                        EscapeForwardSlash = false
+                                    },
+                                }
+                            },
+                            encode: false
+                        )
                     }
                 };
             }
+
+            _notSentEventsQueue = new FixedSizeQueue<AsyncLogEventInfo>(MaxQueueItems);
         }
 
         /// <inheritdoc />
         protected override void Write(AsyncLogEventInfo logEvent)
         {
-            SendBatch(new[] { logEvent });
+            SendBatch(new List<AsyncLogEventInfo> { logEvent });
         }
 
         /// <inheritdoc />
@@ -387,11 +479,40 @@ namespace NLog.Targets.ElasticSearch
         {
             try
             {
-                var payload = EnableJsonLayout ? FromPayloadWithJsonLayout(logEvents) : FormPayload(logEvents);
+                // If we have had a failure, wait for a while before trying again
+                if (
+                    _lastSendFailure.AddMilliseconds(SendTimeoutOnFailureInMilliseconds)
+                    > DateTimeOffset.Now
+                )
+                {
+                    // Queue the events for later processing
+                    foreach (var ev in logEvents)
+                    {
+                        _notSentEventsQueue.Enqueue(ev);
+                    }
+                    return;
+                }
+
+                // add all queued events to the current batch
+                while (_notSentEventsQueue.Count > 0)
+                {
+                    var ev = _notSentEventsQueue.Dequeue();
+                    logEvents.Add(ev);
+                }
+
+                var payload = EnableJsonLayout
+                    ? FromPayloadWithJsonLayout(logEvents)
+                    : FormPayload(logEvents);
 
                 var result = _client.Bulk<BulkResponse>(payload);
 
-                var exception = result.ApiCall?.Success ?? false ? null : result.OriginalException ?? new Exception("No error message. Enable Trace logging for more information.");
+                var exception =
+                    result.ApiCall?.Success ?? false
+                        ? null
+                        : result.OriginalException
+                            ?? new Exception(
+                                "No error message. Enable Trace logging for more information."
+                            );
 
                 if (result.ServerError != null)
                 {
@@ -400,16 +521,24 @@ namespace NLog.Targets.ElasticSearch
 
                 foreach (var itemWithError in result.ItemsWithErrors)
                 {
-                    InternalLogger.Error($"ElasticSearch: Bulk item failed: index:{itemWithError.Index} result:{itemWithError.Result} type:{itemWithError.Type} error:{itemWithError.Error}");
+                    InternalLogger.Error(
+                        $"ElasticSearch: Bulk item failed: index:{itemWithError.Index} result:{itemWithError.Result} type:{itemWithError.Type} error:{itemWithError.Error}"
+                    );
                 }
 
                 if (exception != null)
                 {
-                    InternalLogger.Error(exception.FlattenToActualException(), $"ElasticSearch: Failed to send log messages. Status={result.ApiCall?.HttpStatusCode} Uri={result.ApiCall?.Uri} DebugInformation={result.DebugInformation}");
+                    InternalLogger.Error(
+                        exception.FlattenToActualException(),
+                        $"ElasticSearch: Failed to send log messages. Status={result.ApiCall?.HttpStatusCode} Uri={result.ApiCall?.Uri} DebugInformation={result.DebugInformation}"
+                    );
                 }
                 else if (InternalLogger.IsTraceEnabled)
                 {
-                    InternalLogger.Trace("ElasticSearch: Send Log DebugInfo={0}", result.DebugInformation);
+                    InternalLogger.Trace(
+                        "ElasticSearch: Send Log DebugInfo={0}",
+                        result.DebugInformation
+                    );
                 }
                 else if (InternalLogger.IsDebugEnabled)
                 {
@@ -421,6 +550,20 @@ namespace NLog.Targets.ElasticSearch
                     }
                 }
 
+                if (exception is ElasticsearchClientException)
+                {
+                    var clientException = exception as ElasticsearchClientException;
+                    if (clientException.FailureReason == PipelineFailure.FailedProductCheck)
+                    {
+                        _lastSendFailure = DateTimeOffset.Now;
+                        // Queue the events for later processing
+                        foreach (var ev in logEvents)
+                        {
+                            _notSentEventsQueue.Enqueue(ev);
+                        }
+                    }
+                }
+
                 foreach (var ev in logEvents)
                 {
                     ev.Continuation(exception);
@@ -428,7 +571,10 @@ namespace NLog.Targets.ElasticSearch
             }
             catch (Exception ex)
             {
-                InternalLogger.Error(ex.FlattenToActualException(), "ElasticSearch: Error while sending log messages");
+                InternalLogger.Error(
+                    ex.FlattenToActualException(),
+                    "ElasticSearch: Error while sending log messages"
+                );
                 foreach (var ev in logEvents)
                 {
                     ev.Continuation(ex);
@@ -438,7 +584,7 @@ namespace NLog.Targets.ElasticSearch
 
         private PostData FromPayloadWithJsonLayout(ICollection<AsyncLogEventInfo> logEvents)
         {
-            var payload = new List<string>(logEvents.Count * 2);    // documentInfo + document
+            var payload = new List<string>(logEvents.Count * 2); // documentInfo + document
 
             foreach (var ev in logEvents)
             {
@@ -456,7 +602,7 @@ namespace NLog.Targets.ElasticSearch
 
         private PostData FormPayload(ICollection<AsyncLogEventInfo> logEvents)
         {
-            var payload = new List<object>(logEvents.Count * 2);    // documentInfo + document
+            var payload = new List<object>(logEvents.Count * 2); // documentInfo + document
 
             foreach (var ev in logEvents)
             {
@@ -466,7 +612,12 @@ namespace NLog.Targets.ElasticSearch
                 var documentType = RenderLogEvent(DocumentType, logEvent);
                 var pipeLine = RenderLogEvent(Pipeline, logEvent);
 
-                var documentInfo = GenerateDocumentInfo(OpCodeCreate, index, documentType, pipeLine);
+                var documentInfo = GenerateDocumentInfo(
+                    OpCodeCreate,
+                    index,
+                    documentType,
+                    pipeLine
+                );
                 var document = GenerateDocumentProperties(logEvent);
 
                 payload.Add(documentInfo);
@@ -496,12 +647,20 @@ namespace NLog.Targets.ElasticSearch
 
                 try
                 {
-                    document[field.Name] = renderedField.ToSystemType(field.LayoutType, logEvent.FormatProvider, JsonSerializer);
+                    document[field.Name] = renderedField.ToSystemType(
+                        field.LayoutType,
+                        logEvent.FormatProvider,
+                        JsonSerializer
+                    );
                 }
                 catch (Exception ex)
                 {
                     _jsonSerializer = null; // Reset as it might now be in bad state
-                    InternalLogger.Warn(ex, "ElasticSearch: Error while formatting field: {0}", field.Name);
+                    InternalLogger.Warn(
+                        ex,
+                        "ElasticSearch: Error while formatting field: {0}",
+                        field.Name
+                    );
                 }
             }
 
@@ -535,7 +694,12 @@ namespace NLog.Targets.ElasticSearch
             return document;
         }
 
-        private static object GenerateDocumentInfo(bool opCodeCreate, string index, string documentType, string pipeLine)
+        private static object GenerateDocumentInfo(
+            bool opCodeCreate,
+            string index,
+            string documentType,
+            string pipeLine
+        )
         {
             if (string.IsNullOrEmpty(pipeLine))
             {
@@ -566,9 +730,25 @@ namespace NLog.Targets.ElasticSearch
                 else
                 {
                     if (opCodeCreate)
-                        return new { create = new { _index = index, _type = documentType, pipeline = pipeLine } };
+                        return new
+                        {
+                            create = new
+                            {
+                                _index = index,
+                                _type = documentType,
+                                pipeline = pipeLine
+                            }
+                        };
                     else
-                        return new { index = new { _index = index, _type = documentType, pipeline = pipeLine } };
+                        return new
+                        {
+                            index = new
+                            {
+                                _index = index,
+                                _type = documentType,
+                                pipeline = pipeLine
+                            }
+                        };
                 }
             }
         }
@@ -577,21 +757,36 @@ namespace NLog.Targets.ElasticSearch
         {
             try
             {
-                var jsonSerializer = (MaxRecursionLimit == 0 || MaxRecursionLimit == 1) ? JsonSerializerFlat : JsonSerializer;
+                var jsonSerializer =
+                    (MaxRecursionLimit == 0 || MaxRecursionLimit == 1)
+                        ? JsonSerializerFlat
+                        : JsonSerializer;
                 return ObjectConverter.FormatValueSafe(value, MaxRecursionLimit, jsonSerializer);
             }
             catch (Exception ex)
             {
                 _jsonSerializer = null; // Reset as it might now be in bad state
                 _flatJsonSerializer = null;
-                InternalLogger.Debug(ex, "ElasticSearch: Error while formatting property: {0}", propertyName);
+                InternalLogger.Debug(
+                    ex,
+                    "ElasticSearch: Error while formatting property: {0}",
+                    propertyName
+                );
                 return null;
             }
         }
 
-        private static JsonSerializerSettings CreateJsonSerializerSettings(bool specialPropertyResolver, IList<ObjectTypeConvert> objectTypeConverters)
+        private static JsonSerializerSettings CreateJsonSerializerSettings(
+            bool specialPropertyResolver,
+            IList<ObjectTypeConvert> objectTypeConverters
+        )
         {
-            var jsonSerializerSettings = new JsonSerializerSettings { ReferenceLoopHandling = ReferenceLoopHandling.Ignore, NullValueHandling = NullValueHandling.Ignore, CheckAdditionalContent = true };
+            var jsonSerializerSettings = new JsonSerializerSettings
+            {
+                ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
+                NullValueHandling = NullValueHandling.Ignore,
+                CheckAdditionalContent = true
+            };
             jsonSerializerSettings.Converters.Add(new StringEnumConverter());
             foreach (var typeConverter in objectTypeConverters ?? Array.Empty<ObjectTypeConvert>())
             {
@@ -599,11 +794,17 @@ namespace NLog.Targets.ElasticSearch
                 if (jsonConverter != null)
                     jsonSerializerSettings.Converters.Add(jsonConverter);
                 else
-                    InternalLogger.Debug("ElasticSearch: TypeConverter for {0} has no JsonConverter", typeConverter.ObjectType);
+                    InternalLogger.Debug(
+                        "ElasticSearch: TypeConverter for {0} has no JsonConverter",
+                        typeConverter.ObjectType
+                    );
             }
             jsonSerializerSettings.Error = (sender, args) =>
             {
-                InternalLogger.Debug(args.ErrorContext.Error, $"ElasticSearch: Error serializing exception property '{args.ErrorContext.Member}', property ignored");
+                InternalLogger.Debug(
+                    args.ErrorContext.Error,
+                    $"ElasticSearch: Error serializing exception property '{args.ErrorContext.Member}', property ignored"
+                );
                 args.ErrorContext.Handled = true;
             };
             if (specialPropertyResolver)
